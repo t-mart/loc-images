@@ -8,6 +8,7 @@ authors = ["Tim Martin <tim@timmart.in>"]
 python = "^3.10"
 click = "^8.0.3"
 httpx = "^0.22.0"
+yarl = "^1.7.2"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.931"

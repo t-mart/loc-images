@@ -1,6 +1,6 @@
 # loc-images
 
-Output a list of images from a Library of Congress collection.
+Output a list of images from a Library of Congress query.
 
 This program does not download the images. (Use `aria2c -i <file>` for that, for
 example.)
