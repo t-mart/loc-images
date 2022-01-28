@@ -103,6 +103,7 @@ def main(url: str, aria_format: bool) -> None:
                     # the Content-Type header
                     suffix = Path(URL(image_url).path).suffix
                     lines.append(f"  out={safe_title}{suffix}")
+                    lines.append("  auto-file-renaming=false")
 
                 print("\n".join(lines))
 
