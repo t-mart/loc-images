@@ -3,11 +3,18 @@ Output a list of image URLs from a Library of Congress collection.
 """
 
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 import click
 import httpx
+from tenacity import (  # type: ignore
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    wait_exponential,
+)
 from yarl import URL
 
 SKIP_ORIGINAL_FORMAT_TYPES = ["collection", "web page"]
@@ -15,6 +22,50 @@ SKIP_ORIGINAL_FORMAT_TYPES = ["collection", "web page"]
 # Set of characters blocked in filenames by nix/windows/osx.
 # Source: https://stackoverflow.com/a/31976060/235992
 BLOCKED_FILE_NAME_CHARS = {chr(i) for i in range(32)} | set(R'<>:"/\|?*')
+
+# For us, I think it's the crawl limit:
+#   Collections, format, and other endpoints:
+#   - Burst Limit  	20 requests per 10 seconds, Block for 5 minutes
+#   - Crawl Limit 	80 requests per 1 minute, Block for 1 hour
+# https://www.loc.gov/apis/json-and-yaml/
+SECONDS_PER_REQUEST_LIMIT = 60 / 80
+
+
+class RetryableStatusException(Exception):
+    """Retryable status in HTTP response."""
+
+
+def print_retrying(retry_state: RetryCallState) -> None:
+    """Print the retry attempt."""
+    if retry_state.attempt_number > 1:
+        print(
+            f"\tRetrying HTTP request, attempt #{retry_state.attempt_number}",
+            file=sys.stderr,
+        )
+
+
+@retry(
+    retry=retry_if_exception_type(RetryableStatusException),
+    before=print_retrying,
+    wait=wait_exponential(multiplier=1, max=4096),
+)
+def http_get_query(url: str, client: httpx.Client) -> httpx.Response:
+    """Return the response of an HTTP GET request."""
+    # in testing, the LOC api has been spewing 500s. maybe this is rate limiting?
+    response = client.get(
+        url, params={"fo": "json", "c": 100, "at": "results,pagination"}
+    )
+    if response.status_code != httpx.codes.OK:
+        if response.status_code == 429 or response.status_code in range(500, 600):
+            # i haven't seen a 429, but i'd imagine that's what they'd use.
+            raise RetryableStatusException(
+                f"Got response status code {response.status_code} when requesting "
+                f"{url}, but this seems to just be rate-limiting"
+            )
+        raise click.ClickException(
+            f"Got response status code {response.status_code} when requesting " f"{url}"
+        )
+    return response
 
 
 def file_name_sanitize(name: str) -> str:
@@ -72,14 +123,7 @@ def main(url: str, aria_format: bool) -> None:
     with httpx.Client() as client:
         while True:
             print(f"Getting images from {cur_url}", file=sys.stderr)
-            response = client.get(
-                cur_url, params={"fo": "json", "c": 100, "at": "results,pagination"}
-            )
-            if response.status_code != httpx.codes.OK:
-                raise click.ClickException(
-                    f"Got response status code {response.status_code} when requesting "
-                    f"{cur_url}"
-                )
+            response = http_get_query(cur_url, client)
             data = response.json()
             for result in data["results"]:
                 if any(
@@ -109,6 +153,7 @@ def main(url: str, aria_format: bool) -> None:
 
             if data["pagination"]["next"] is not None:
                 cur_url = data["pagination"]["next"]
+                time.sleep(SECONDS_PER_REQUEST_LIMIT)
             else:
                 break
 
