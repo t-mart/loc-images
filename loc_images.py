@@ -2,10 +2,11 @@
 Output a list of image URLs from a Library of Congress collection.
 """
 
-import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
+import arrow
+from rich.console import Console
 
 import click
 import httpx
@@ -16,6 +17,8 @@ from tenacity import (  # type: ignore
     wait_exponential,
 )
 from yarl import URL
+
+CONSOLE = Console(stderr=True, highlight=False)
 
 SKIP_ORIGINAL_FORMAT_TYPES = ["collection", "web page"]
 
@@ -30,41 +33,55 @@ BLOCKED_FILE_NAME_CHARS = {chr(i) for i in range(32)} | set(R'<>:"/\|?*')
 # https://www.loc.gov/apis/json-and-yaml/
 SECONDS_PER_REQUEST_LIMIT = 60 / 80
 
+MAX_WAIT_RETRY_DELAY = 4096  # just over an hour, and is a multiple of two (exp backoff)
 
-class RetryableStatusException(Exception):
+
+def print_failed_try(retry_state: RetryCallState) -> None:
+    """Print some status information about retrying the method."""
+    if retry_state.outcome is None:
+        return  # technically optional, but it should always be present after fail
+    exception = retry_state.outcome.exception(timeout=0)
+    if exception is None:
+        return  # have to check for this according to concurrent.futures docs.
+
+    next_wait_seconds = retry_state.retry_object.wait(retry_state)
+    next_wait_expiry = arrow.now().shift(seconds=+next_wait_seconds)
+
+    CONSOLE.print(
+        (
+            f"\tRequest attempt [bold]#{retry_state.attempt_number}[/bold] threw "
+            f"exception: [red]{exception.args[0]}[/red]. Retrying after wait of "
+            f"{next_wait_seconds} seconds ({next_wait_expiry})..."
+        )
+    )
+
+
+class RetryableHTTPException(Exception):
     """Retryable status in HTTP response."""
 
 
-def print_retrying(retry_state: RetryCallState) -> None:
-    """Print the retry attempt."""
-    if retry_state.attempt_number > 1:
-        print(
-            f"\tRetrying HTTP request, attempt #{retry_state.attempt_number}",
-            file=sys.stderr,
-        )
-
-
 @retry(
-    retry=retry_if_exception_type(RetryableStatusException),
-    before=print_retrying,
-    wait=wait_exponential(multiplier=1, max=4096),
+    retry=retry_if_exception_type(RetryableHTTPException),
+    after=print_failed_try,
+    wait=wait_exponential(max=MAX_WAIT_RETRY_DELAY),
 )
-def http_get_query(url: str, client: httpx.Client) -> httpx.Response:
-    """Return the response of an HTTP GET request."""
-    # in testing, the LOC api has been spewing 500s. maybe this is rate limiting?
-    response = client.get(
-        url, params={"fo": "json", "c": 100, "at": "results,pagination"}
-    )
+def send_request(request: httpx.Request, client: httpx.Client) -> httpx.Response:
+    """
+    Return the response of the HTTP request object.
+
+    Timeouts, status 429, and 500s statuses will throw `RetryableHTTPException`.
+    """
+    # in testing, the LOC api has been spewing 500s. maybe this is the rate limiting?
+    try:
+        response = client.send(request)
+    except httpx.ReadTimeout as read_timeout:
+        raise RetryableHTTPException("Read time out") from read_timeout
     if response.status_code != httpx.codes.OK:
         if response.status_code == 429 or response.status_code in range(500, 600):
-            # i haven't seen a 429, but i'd imagine that's what they'd use.
-            raise RetryableStatusException(
-                f"Got response status code {response.status_code} when requesting "
-                f"{url}, but this seems to just be rate-limiting"
-            )
-        raise click.ClickException(
-            f"Got response status code {response.status_code} when requesting " f"{url}"
-        )
+            # i haven't seen a 429, but i'd imagine that's what they'd use. for now,
+            # i've just seen 500s, so i'm not sure what to think.
+            raise RetryableHTTPException(f"Status code == {response.status_code}")
+        raise click.ClickException(f"Non-retryable status code {response.status_code}")
     return response
 
 
@@ -122,8 +139,13 @@ def main(url: str, aria_format: bool) -> None:
 
     with httpx.Client() as client:
         while True:
-            print(f"Getting images from {cur_url}", file=sys.stderr)
-            response = http_get_query(cur_url, client)
+            CONSOLE.print(f"Getting images from [link={cur_url}]{cur_url}[/link]")
+            request = httpx.Request(
+                method="GET",
+                url=cur_url,
+                params={"fo": "json", "c": 100, "at": "results,pagination"},
+            )
+            response = send_request(request, client)
             data = response.json()
             for result in data["results"]:
                 if any(

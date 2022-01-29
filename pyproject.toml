@@ -10,6 +10,8 @@ click = "^8.0.3"
 httpx = "^0.22.0"
 yarl = "^1.7.2"
 tenacity = "^8.0.1"
+arrow = "^1.2.2"
+rich = "^11.1.0"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.931"
