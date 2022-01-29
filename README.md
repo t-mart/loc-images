@@ -24,6 +24,26 @@ Or, with aria2:
 loc-images "https://www.loc.gov/collections/andre-kostelanetz-collection/" | aria2 -i -
 ```
 
+### Rate Limiting
+
+The Library of Congress has
+[rate limits to crawling its API](https://www.loc.gov/apis/json-and-yaml/). For collections
+(like what this program searches), you can perform 80 requests per minute. Not following this will
+lead to a 1 hour ban.
+
+**This rate limit is built into the program. You do not have to do anything to follow it.**
+
+### Retries
+
+Frequently during testing, I encountered 500 status codes in responses. This may be the rate
+limiting in action -- I am not sure.
+
+Nonetheless, to be robust in case limits are encountered, especially because searches can be many
+pages long, this program utilizes an exponential backoff retry policy on requests to the LoC API.
+
+The minimum retry delay is consistent with the 80 requests per minute rate. The maximum delay is
+4096 seconds, just over the 1 hour ban time in case one has been issued to you.
+
 ## Installation
 
 Ensure you have Python >= 3.10.
