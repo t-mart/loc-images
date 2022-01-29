@@ -63,7 +63,7 @@ class RetryableHTTPException(Exception):
 @retry(
     retry=retry_if_exception_type(RetryableHTTPException),
     after=print_failed_try,
-    wait=wait_exponential(max=MAX_WAIT_RETRY_DELAY),
+    wait=wait_exponential(min=SECONDS_PER_REQUEST_LIMIT, max=MAX_WAIT_RETRY_DELAY),
 )
 def send_request(request: httpx.Request, client: httpx.Client) -> httpx.Response:
     """
