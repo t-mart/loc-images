@@ -5,11 +5,11 @@ Output a list of image URLs from a Library of Congress collection.
 import time
 from pathlib import Path
 from typing import Any, Optional
-import arrow
-from rich.console import Console
 
+import arrow
 import click
 import httpx
+from rich.console import Console
 from tenacity import (  # type: ignore
     RetryCallState,
     retry,
@@ -18,22 +18,29 @@ from tenacity import (  # type: ignore
 )
 from yarl import URL
 
+# user-friendly wrapper around stdout, prints statuses nicely
 CONSOLE = Console(stderr=True, highlight=False)
 
+# original format types that we don't want to download
 SKIP_ORIGINAL_FORMAT_TYPES = ["collection", "web page"]
 
 # Set of characters blocked in filenames by nix/windows/osx.
 # Source: https://stackoverflow.com/a/31976060/235992
 BLOCKED_FILE_NAME_CHARS = {chr(i) for i in range(32)} | set(R'<>:"/\|?*')
 
-# For us, I think it's the crawl limit:
-#   Collections, format, and other endpoints:
-#   - Burst Limit  	20 requests per 10 seconds, Block for 5 minutes
-#   - Crawl Limit 	80 requests per 1 minute, Block for 1 hour
+# time to wait between requests (and the minimum retry delay)
+# For us, I think it's this crawl limit:
+# > "80 requests per 1 minute, Block for 1 hour"
 # https://www.loc.gov/apis/json-and-yaml/
 SECONDS_PER_REQUEST_LIMIT = 60 / 80
 
-MAX_WAIT_RETRY_DELAY = 4096  # just over an hour, and is a multiple of two (exp backoff)
+# max amount of time to wait between retries
+# just a bit more than the ban length of 1 hour, and is a multiple of two (exp backoff)
+MAX_WAIT_RETRY_DELAY = 4096
+
+# max length of the path stem for aria2 formatting
+# this is arbitrary, but i know there's a limit, and it's probably just a bit over this
+MAX_PATH_STEM_LENGTH = 200
 
 
 def print_failed_try(retry_state: RetryCallState) -> None:
@@ -115,6 +122,26 @@ def get_highest_quality_image_url(result: dict[str, Any]) -> Optional[str]:
     return best_image
 
 
+def create_filename(result: dict[str, Any], image_url: str) -> str:
+    """
+    Create a filename for aria2 formatting. Tries to ensure its not too long, nor
+    contains illegal characters.
+    """
+    id_number = Path(URL(result["url"]).path).parts[-1]
+    title = file_name_sanitize(result["title"])
+    stem = f"{id_number} - {title}"[:MAX_PATH_STEM_LENGTH]
+
+    # this suffix determination is a little brittle.
+    # it'd be better to make an http HEAD request to the url and inspect
+    # the Content-Type header, but that's a lot more requests.
+    # this works for now because the URLs contain the suffixes: https://foo.com/lol.jpg
+    suffix = Path(URL(image_url).path).suffix
+
+    safe_title = f"{stem}{suffix}"
+
+    return safe_title
+
+
 @click.command()
 @click.argument("url")
 @click.option(
@@ -162,13 +189,7 @@ def main(url: str, aria_format: bool) -> None:
 
                 if aria_format:
                     lines.insert(0, f"# {result['id']}")
-
-                    safe_title = file_name_sanitize(result["title"])
-                    # this suffix determination is a little brittle.
-                    # it'd be better to make an http HEAD request to the url and inspect
-                    # the Content-Type header
-                    suffix = Path(URL(image_url).path).suffix
-                    lines.append(f"  out={safe_title}{suffix}")
+                    lines.append(f"  out={create_filename(result, image_url)}")
                     lines.append("  auto-file-renaming=false")
 
                 print("\n".join(lines))
