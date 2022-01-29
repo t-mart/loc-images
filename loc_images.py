@@ -19,7 +19,7 @@ from tenacity import (  # type: ignore
 from yarl import URL
 
 # user-friendly wrapper around stdout, prints statuses nicely
-CONSOLE = Console(stderr=True, highlight=False)
+CONSOLE = Console(stderr=True)
 
 # original format types that we don't want to download
 SKIP_ORIGINAL_FORMAT_TYPES = ["collection", "web page"]
