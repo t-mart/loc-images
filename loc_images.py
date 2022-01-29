@@ -167,13 +167,16 @@ def main(url: str, aria_format: bool) -> None:
     with httpx.Client() as client:
         while True:
             CONSOLE.print(f"Getting images from [link={cur_url}]{cur_url}[/link]")
+
             request = httpx.Request(
                 method="GET",
                 url=cur_url,
                 params={"fo": "json", "c": 100, "at": "results,pagination"},
             )
+
             response = send_request(request, client)
             data = response.json()
+
             for result in data["results"]:
                 if any(
                     t in result["original_format"] for t in SKIP_ORIGINAL_FORMAT_TYPES
@@ -188,9 +191,22 @@ def main(url: str, aria_format: bool) -> None:
                 lines = [image_url]
 
                 if aria_format:
+                    # little comment for humans about what the source file is
+                    # put at beginning
                     lines.insert(0, f"# {result['id']}")
+
+                    # options for aria2 invocation
+                    # these must be prefixed with whitespace
+                    # ======================================
+                    # 1. sets the name of the output file. the defaults are gross
                     lines.append(f"  out={create_filename(result, image_url)}")
+                    # 2. forbids aria2 from downloading foo.1.jpg if foo.jpg exists, and
+                    # instead, just skips the URL. we don't want duplicates, nor do we
+                    # want to overwrite existing files.
                     lines.append("  auto-file-renaming=false")
+
+                    # make it easier to read each url and its options with a line break
+                    lines.append("")
 
                 print("\n".join(lines))
 
