@@ -2,8 +2,6 @@
 Output a list of image URLs from a Library of Congress collection.
 """
 
-# TODO:
-# - instead of exclude original_format types, include only images?
 
 import time
 from pathlib import Path
@@ -179,6 +177,9 @@ def get_highest_quality_image_url(result: dict[str, Any]) -> Optional[str]:
 
 
 def create_aria_option_line(key: str, value: str) -> str:
+    """Return a string that specifies an aria2c option, such as key=value."""
+    # the whitespace is important: needs to be whitespace-prefixed to differentiate from
+    # other URLs
     return f"  {key}={value}"
 
 
@@ -246,7 +247,10 @@ ARIA_DIR_PATH_PARAM_TYPE = AriaDirPathParamType()
     "--root-dir",
     default=Path("."),
     type=ARIA_DIR_PATH_PARAM_TYPE,
-    help=("When aria2c formatting, set the root directory of image downloads."),
+    help=(
+        "When aria2c formatting, set the root directory of image downloads to this "
+        "path."
+    ),
 )
 def main(
     url: str, aria_format: bool, group_by_collection: bool, root_dir: Path
@@ -282,10 +286,20 @@ def main(
             for result in data["results"]:
                 # ensure one of the allowed ORIGINAL_FORMAT_TYPES is in the item's
                 # original_format list
+                # honestly, it's kinda curious that there can be mulitple original
+                # format types (it's a list). feels like an item can only have 1 type
                 if not set(result["original_format"]) & ORIGINAL_FORMAT_TYPES:
                     continue
-                # same, but with online types
-                if not set(result["online_format"]) & ONLINE_TYPES:
+                # same as above, but with online types
+                # we check for key presence first, because its not always there, such
+                # as for https://www.loc.gov/item/afc1981004.b54868/ Probably LoC bug.
+                # Our image finding logic below is robust enough to know if there's
+                # not actually an image, so for now, we just let it slide and let that
+                # code make the final call.
+                if (
+                    "online_format" in result
+                    and not set(result["online_format"]) & ONLINE_TYPES
+                ):
                     continue
 
                 image_url = get_highest_quality_image_url(result)
