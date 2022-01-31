@@ -22,7 +22,7 @@ from tenacity import (  # type: ignore
 from yarl import URL
 
 # user-friendly wrapper around stdout, prints statuses nicely
-CONSOLE = Console(stderr=True)
+CONSOLE = Console(stderr=True, highlight=False)
 
 # original formats (original representation of the item) that we want.
 # other types are like 'manuscript/mixed material' or 'sound recording' or 'web site'.
@@ -62,7 +62,7 @@ MAX_DIR_NAME_LENGTH = 200
 # results per page
 # i haven't tested how high this will go, but the higher the better. but if it gets
 # too high, LoC may close the connection during transfer.
-STARTING_RESULTS_PER_PAGE = 500
+STARTING_RESULTS_PER_PAGE = 250
 
 
 def print_failed_try(retry_state: RetryCallState) -> None:
@@ -94,9 +94,7 @@ class RetryableHTTPException(Exception):
     after=print_failed_try,
     wait=wait_exponential(min=SECONDS_PER_REQUEST_LIMIT, max=MAX_WAIT_RETRY_DELAY),
 )
-def send_loc_request(
-    url: str, client: httpx.Client, results_per_page: int = STARTING_RESULTS_PER_PAGE
-) -> dict[str, Any]:
+def send_loc_request(url: str, client: httpx.Client) -> dict[str, Any]:
     """
     Return the response of the HTTP request object.
 
@@ -106,28 +104,13 @@ def send_loc_request(
     try:
         response = client.get(
             url=url,
-            params={
-                "fo": "json",
-                "c": results_per_page,
-                "at": "results,pagination",
-            },
         )
     except httpx.ReadTimeout as read_timeout:
         raise RetryableHTTPException("Read time out") from read_timeout
     except httpx.RemoteProtocolError as remote_proto_error:
-        # if the response is too big, we'll encounter this exception.
-        # here, we have logic to decrease the number of results in the response until
-        # a certain point, after which, we'll just fail outright.
-        # (i hope this works ok with the retry?)
-        CONSOLE.print(f"\tRequest attempt threw: {remote_proto_error}")
-        new_results_per_page = results_per_page // 2
-        if new_results_per_page >= 50:
-            CONSOLE.print(
-                "\tNumber of results per page is probably too large. Decreasing to "
-                f"{results_per_page} and trying again..."
-            )
-            return send_loc_request(url, client, results_per_page // 2)
-        raise remote_proto_error
+        raise RetryableHTTPException(
+            f"Remote problem ({remote_proto_error})"
+        ) from remote_proto_error
 
     if response.status_code != httpx.codes.OK:
         if response.status_code == 429 or response.status_code in range(500, 600):
@@ -293,8 +276,13 @@ def main(
     - loc-images "https://www.loc.gov/photos/?q=bridges&dates=1800%2F1899"
     """
     cur_url = url
+    params = {
+        "fo": "json",
+        "c": str(STARTING_RESULTS_PER_PAGE),
+        "at": "results,pagination",
+    }
 
-    with httpx.Client() as client:
+    with httpx.Client(params=params) as client:
         while True:
             CONSOLE.print(f"Getting images from [link={cur_url}]{cur_url}[/link]")
 
