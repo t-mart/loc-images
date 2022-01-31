@@ -3,8 +3,6 @@ Output a list of image URLs from a Library of Congress collection.
 """
 
 # TODO:
-# - bump results per page?
-# - include collection name in aria format (what if no collection name?)
 # - instead of exclude original_format types, include only images?
 
 import time
@@ -51,6 +49,10 @@ MAX_PATH_STEM_LENGTH = 200
 
 # max dir length. again, arbitrary, but i know there's some limit
 MAX_DIR_NAME_LENGTH = 200
+
+# results per page
+# i haven't tested how high this will go, but the higher the better
+RESULTS_PER_PAGE = 1000
 
 
 def print_failed_try(retry_state: RetryCallState) -> None:
@@ -257,7 +259,11 @@ def main(
             request = httpx.Request(
                 method="GET",
                 url=cur_url,
-                params={"fo": "json", "c": 100, "at": "results,pagination"},
+                params={
+                    "fo": "json",
+                    "c": RESULTS_PER_PAGE,
+                    "at": "results,pagination",
+                },
             )
 
             response = send_request(request, client)
