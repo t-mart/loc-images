@@ -26,8 +26,18 @@ from yarl import URL
 # user-friendly wrapper around stdout, prints statuses nicely
 CONSOLE = Console(stderr=True)
 
-# original format types that we don't want to download
-SKIP_ORIGINAL_FORMAT_TYPES = ["collection", "web page"]
+# "original format" (original representation of the item) types that we want.
+# other types are like 'manuscript/mixed material' or 'sound recording' or 'web site'.
+# maybe in the future, we will support more types?
+ORIGINAL_FORMAT_TYPES = {
+    "photo, print, drawing",
+}
+
+# "online format" (how LoC represents the item) types that we want
+# again, maybe we can take more types in the future.
+ONLINE_TYPES = {
+    "image",
+}
 
 # Set of characters blocked in filenames by nix/windows/osx.
 # Source: https://stackoverflow.com/a/31976060/235992
@@ -269,15 +279,13 @@ def main(
             response = send_request(request, client)
             data = response.json()
 
-            import json
-
-            with (Path(__file__).parent / "last.json").open("w") as f:
-                json.dump(data, f, indent=2)
-
             for result in data["results"]:
-                if any(
-                    t in result["original_format"] for t in SKIP_ORIGINAL_FORMAT_TYPES
-                ):
+                # ensure one of the allowed ORIGINAL_FORMAT_TYPES is in the item's
+                # original_format list
+                if not set(result["original_format"]) & ORIGINAL_FORMAT_TYPES:
+                    continue
+                # same, but with online types
+                if not set(result["online_format"]) & ONLINE_TYPES:
                     continue
 
                 image_url = get_highest_quality_image_url(result)
