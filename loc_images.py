@@ -24,7 +24,7 @@ from yarl import URL
 # user-friendly wrapper around stdout, prints statuses nicely
 CONSOLE = Console(stderr=True)
 
-# "original format" (original representation of the item) types that we want.
+# original formats (original representation of the item) that we want.
 # other types are like 'manuscript/mixed material' or 'sound recording' or 'web site'.
 # maybe in the future, we will support more types?
 ORIGINAL_FORMAT_TYPES = {
@@ -32,7 +32,7 @@ ORIGINAL_FORMAT_TYPES = {
     "map",
 }
 
-# "online format" (how LoC represents the item) types that we want
+# online formats (LoC representation of the item) that we want
 # again, maybe we can take more types in the future.
 ONLINE_TYPES = {
     "image",
@@ -60,8 +60,9 @@ MAX_PATH_STEM_LENGTH = 200
 MAX_DIR_NAME_LENGTH = 200
 
 # results per page
-# i haven't tested how high this will go, but the higher the better
-RESULTS_PER_PAGE = 1000
+# i haven't tested how high this will go, but the higher the better. but if it gets
+# too high, LoC may close the connection during transfer.
+STARTING_RESULTS_PER_PAGE = 500
 
 
 def print_failed_try(retry_state: RetryCallState) -> None:
@@ -93,7 +94,9 @@ class RetryableHTTPException(Exception):
     after=print_failed_try,
     wait=wait_exponential(min=SECONDS_PER_REQUEST_LIMIT, max=MAX_WAIT_RETRY_DELAY),
 )
-def send_request(request: httpx.Request, client: httpx.Client) -> httpx.Response:
+def send_loc_request(
+    url: str, client: httpx.Client, results_per_page: int = STARTING_RESULTS_PER_PAGE
+) -> dict[str, Any]:
     """
     Return the response of the HTTP request object.
 
@@ -101,16 +104,40 @@ def send_request(request: httpx.Request, client: httpx.Client) -> httpx.Response
     """
     # in testing, the LOC api has been spewing 500s. maybe this is the rate limiting?
     try:
-        response = client.send(request)
+        response = client.get(
+            url=url,
+            params={
+                "fo": "json",
+                "c": results_per_page,
+                "at": "results,pagination",
+            },
+        )
     except httpx.ReadTimeout as read_timeout:
         raise RetryableHTTPException("Read time out") from read_timeout
+    except httpx.RemoteProtocolError as remote_proto_error:
+        # if the response is too big, we'll encounter this exception.
+        # here, we have logic to decrease the number of results in the response until
+        # a certain point, after which, we'll just fail outright.
+        # (i hope this works ok with the retry?)
+        CONSOLE.print(f"\tRequest attempt threw: {remote_proto_error}")
+        new_results_per_page = results_per_page // 2
+        if new_results_per_page >= 50:
+            CONSOLE.print(
+                "\tNumber of results per page is probably too large. Decreasing to "
+                f"{results_per_page} and trying again..."
+            )
+            return send_loc_request(url, client, results_per_page // 2)
+        raise remote_proto_error
+
     if response.status_code != httpx.codes.OK:
         if response.status_code == 429 or response.status_code in range(500, 600):
             # i haven't seen a 429, but i'd imagine that's what they'd use. for now,
             # i've just seen 500s, so i'm not sure what to think.
             raise RetryableHTTPException(f"Status code == {response.status_code}")
         raise click.ClickException(f"Non-retryable status code {response.status_code}")
-    return response
+
+    data: dict[str, Any] = response.json()
+    return data
 
 
 def file_name_sanitize(name: str) -> str:
@@ -271,26 +298,26 @@ def main(
         while True:
             CONSOLE.print(f"Getting images from [link={cur_url}]{cur_url}[/link]")
 
-            request = httpx.Request(
-                method="GET",
-                url=cur_url,
-                params={
-                    "fo": "json",
-                    "c": RESULTS_PER_PAGE,
-                    "at": "results,pagination",
-                },
-            )
+            # request =
 
-            response = send_request(request, client)
-            data = response.json()
+            data = send_loc_request(cur_url, client)
+            # data = response.json()
 
             for result in data["results"]:
+                # this usually means its only available at the physical library, not
+                # online. in these cases, an image might be available, but it'll be
+                # really small
+                if result["access_restricted"] is True:
+                    continue
+
                 # ensure one of the allowed ORIGINAL_FORMAT_TYPES is in the item's
                 # original_format list
+                #
                 # honestly, it's kinda curious that there can be mulitple original
                 # format types (it's a list). feels like an item can only have 1 type
                 if not set(result["original_format"]) & ORIGINAL_FORMAT_TYPES:
                     continue
+
                 # same as above, but with online types
                 # we check for key presence first, because its not always there, such
                 # as for https://www.loc.gov/item/afc1981004.b54868/ Probably LoC bug.
@@ -311,11 +338,10 @@ def main(
                 lines = [image_url]
 
                 if aria_format:
-                    # little comment for humans about what the source file is
-                    # put at beginning
+                    # little comment for humans about where to find the item on loc.gov
                     lines.insert(0, f"# {result['id']}")
 
-                    # sets the name of the output file. the defaults are gross
+                    # sets the name of the output file because the defaults are gross
                     lines.append(
                         create_aria_option_line(
                             "out", create_filename(result, image_url)
@@ -323,8 +349,7 @@ def main(
                     )
 
                     # if you want a nicer grouped structure, this option has URLs
-                    # downloaded to directories named by the collection under the root
-                    # dir
+                    # downloaded to a directory named by the collection title
                     if group_by_collection:
                         lines.append(
                             create_aria_option_line(
@@ -337,7 +362,7 @@ def main(
                     # want to overwrite existing files.
                     lines.append(create_aria_option_line("auto-file-renaming", "false"))
 
-                    # make it easier to read each url and its options with a line break
+                    # make it easier to read each url chunk
                     lines.append("")
 
                 print("\n".join(lines))
