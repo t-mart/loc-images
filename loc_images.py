@@ -29,6 +29,7 @@ CONSOLE = Console(stderr=True)
 # maybe in the future, we will support more types?
 ORIGINAL_FORMAT_TYPES = {
     "photo, print, drawing",
+    "map",
 }
 
 # "online format" (how LoC represents the item) types that we want
