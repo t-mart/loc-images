@@ -2,9 +2,16 @@
 Output a list of image URLs from a Library of Congress collection.
 """
 
+# TODO:
+# - bump results per page?
+# - include collection name in aria format (what if no collection name?)
+# - instead of exclude original_format types, include only images?
+
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+from glom import glom
 
 import arrow
 import click
@@ -41,6 +48,9 @@ MAX_WAIT_RETRY_DELAY = 4096
 # max length of the path stem for aria2 formatting
 # this is arbitrary, but i know there's a limit, and it's probably just a bit over this
 MAX_PATH_STEM_LENGTH = 200
+
+# max dir length. again, arbitrary, but i know there's some limit
+MAX_DIR_NAME_LENGTH = 200
 
 
 def print_failed_try(retry_state: RetryCallState) -> None:
@@ -100,6 +110,40 @@ def file_name_sanitize(name: str) -> str:
     return "".join(c for c in name if c not in BLOCKED_FILE_NAME_CHARS)
 
 
+def create_filename(result: dict[str, Any], image_url: str) -> str:
+    """
+    Create an out filename for aria2. Tries to ensure its not too long, nor contains
+    illegal characters.
+    """
+    id_number = Path(URL(result["url"]).path).parts[-1]
+    title = file_name_sanitize(result["title"])
+    stem = f"{id_number} - {title}"[:MAX_PATH_STEM_LENGTH]
+
+    # this suffix determination is a little brittle.
+    # it'd be better to make an http HEAD request to the url and inspect
+    # the Content-Type header, but that's a lot more requests.
+    # this works for now because the URLs contain the suffixes: https://foo.com/lol.jpg
+    suffix = Path(URL(image_url).path).suffix
+
+    safe_title = f"{stem}{suffix}"
+
+    return safe_title
+
+
+def create_collection_dir_path(result: dict[str, Any], root_dir: Path) -> Path:
+    """
+    Create a dir name for aria2, which will be somewhere under root_dir. Tries to ensure
+    its not too long, nor contains illegal characters. This dir name is based on the
+    "source_collection" key of the result json, such as "<root_dir>/<source_collection>.
+    If this key does not exist, the returned Path is simply the root_dir itself.
+    """
+    if (
+        source_collection := glom(result, "item.source_collection", default=None)
+    ) is not None:
+        return root_dir / file_name_sanitize(source_collection)
+    return root_dir
+
+
 def get_highest_quality_image_url(result: dict[str, Any]) -> Optional[str]:
     """
     Returns the highest quality image URL from the result dict. If one does not exist,
@@ -122,24 +166,46 @@ def get_highest_quality_image_url(result: dict[str, Any]) -> Optional[str]:
     return best_image
 
 
-def create_filename(result: dict[str, Any], image_url: str) -> str:
+def create_aria_option_line(key: str, value: str) -> str:
+    return f"  {key}={value}"
+
+
+class AriaDirPathParamType(click.ParamType):
     """
-    Create a filename for aria2 formatting. Tries to ensure its not too long, nor
-    contains illegal characters.
+    Click parameter type for directory Path objects that can be fed to aria2c's --dir
+    option.
+
+    aria2c will fail if the path exists but is not a directory, so the converter of this
+    class does the same. If the path exists and is a directory, aria2c will use it
+    as-is. And finally, if the path does not exist, aria2c will create a directory at
+    it.
     """
-    id_number = Path(URL(result["url"]).path).parts[-1]
-    title = file_name_sanitize(result["title"])
-    stem = f"{id_number} - {title}"[:MAX_PATH_STEM_LENGTH]
 
-    # this suffix determination is a little brittle.
-    # it'd be better to make an http HEAD request to the url and inspect
-    # the Content-Type header, but that's a lot more requests.
-    # this works for now because the URLs contain the suffixes: https://foo.com/lol.jpg
-    suffix = Path(URL(image_url).path).suffix
+    name = "path"
 
-    safe_title = f"{stem}{suffix}"
+    def convert(
+        self,
+        value: Any,
+        param: Optional[click.Parameter],
+        ctx: Optional[click.core.Context],
+    ) -> Path:
+        """
+        Return a Path object from a command line value. Fail if the value cannot be
+        turned into a Path or if the path exists and is not a directory.
+        """
+        if isinstance(value, Path):
+            path = value
+        else:
+            try:
+                path = Path(value)
+            except ValueError:
+                self.fail(f"{value!r} does not represent a path", param, ctx)
+        if path.exists() and not path.is_dir():
+            self.fail(f"{value!r} exists, but is not a directory", param, ctx)
+        return path
 
-    return safe_title
+
+ARIA_DIR_PATH_PARAM_TYPE = AriaDirPathParamType()
 
 
 @click.command()
@@ -148,11 +214,31 @@ def create_filename(result: dict[str, Any], image_url: str) -> str:
     "--aria-format/--no-aria-format",
     default=True,
     help=(
-        "Additionally outputs a more descriptive file title of the images in a format "
-        "that aria2c understands."
+        "Outputs image URLs in a format that aria2c understands. (aria2c can consume "
+        "this file with the -i/--input-file option.) For each url, the "
+        '"out" option is set to the item\'s title and "auto-file-renaming" is '
+        "disabled to prevent clobbering of preexisting files. See "
+        "https://aria2.github.io/manual/en/html/aria2c.html#input-file for more info."
     ),
 )
-def main(url: str, aria_format: bool) -> None:
+@click.option(
+    "--group-by-collection/--no-group-by-collection",
+    default=True,
+    help=(
+        'When aria2c formatting, set the "dir" option to the item\'s collection name. '
+        "Items without a collection will be downloaded directly to the path of "
+        "root-dir."
+    ),
+)
+@click.option(
+    "--root-dir",
+    default=Path("."),
+    type=ARIA_DIR_PATH_PARAM_TYPE,
+    help=("When aria2c formatting, set the root directory of image downloads."),
+)
+def main(
+    url: str, aria_format: bool, group_by_collection: bool, root_dir: Path
+) -> None:
     """
     Output a list of images from a Library of Congress query at URL.
 
@@ -177,6 +263,11 @@ def main(url: str, aria_format: bool) -> None:
             response = send_request(request, client)
             data = response.json()
 
+            import json
+
+            with (Path(__file__).parent / "last.json").open("w") as f:
+                json.dump(data, f, indent=2)
+
             for result in data["results"]:
                 if any(
                     t in result["original_format"] for t in SKIP_ORIGINAL_FORMAT_TYPES
@@ -195,15 +286,27 @@ def main(url: str, aria_format: bool) -> None:
                     # put at beginning
                     lines.insert(0, f"# {result['id']}")
 
-                    # options for aria2 invocation
-                    # these must be prefixed with whitespace
-                    # ======================================
-                    # 1. sets the name of the output file. the defaults are gross
-                    lines.append(f"  out={create_filename(result, image_url)}")
-                    # 2. forbids aria2 from downloading foo.1.jpg if foo.jpg exists, and
+                    # sets the name of the output file. the defaults are gross
+                    lines.append(
+                        create_aria_option_line(
+                            "out", create_filename(result, image_url)
+                        )
+                    )
+
+                    # if you want a nicer grouped structure, this option has URLs
+                    # downloaded to directories named by the collection under the root
+                    # dir
+                    if group_by_collection:
+                        lines.append(
+                            create_aria_option_line(
+                                "dir", str(create_collection_dir_path(result, root_dir))
+                            )
+                        )
+
+                    # forbids aria2 from downloading foo.1.jpg if foo.jpg exists, and
                     # instead, just skips the URL. we don't want duplicates, nor do we
                     # want to overwrite existing files.
-                    lines.append("  auto-file-renaming=false")
+                    lines.append(create_aria_option_line("auto-file-renaming", "false"))
 
                     # make it easier to read each url and its options with a line break
                     lines.append("")
