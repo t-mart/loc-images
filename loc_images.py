@@ -7,12 +7,11 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from glom import glom
-
 import arrow
 import click
 import httpx
 from rich.console import Console
+from rich.padding import Padding
 from tenacity import (  # type: ignore
     RetryCallState,
     retry,
@@ -60,9 +59,14 @@ MAX_PATH_STEM_LENGTH = 200
 MAX_DIR_NAME_LENGTH = 200
 
 # results per page
-# i haven't tested how high this will go, but the higher the better. but if it gets
-# too high, LoC may close the connection during transfer.
-STARTING_RESULTS_PER_PAGE = 250
+# ideally, its as high as possible to reduce request count. but somewhere too high, the
+# server will just reset it down to the lowest of 25. further, in testing, i've had the
+# server close the connection because its taking too long (but we have logic to react to
+# that if it happens.)
+# NOTE: this should be a power of two! so that it can adaptively be split in half (many
+# times) if we do encounter connection closure. See more about this in
+# `get_loc_response_json`
+STARTING_RESULTS_PER_PAGE = 512
 
 
 def print_failed_try(retry_state: RetryCallState) -> None:
@@ -77,11 +81,12 @@ def print_failed_try(retry_state: RetryCallState) -> None:
     next_wait_expiry = arrow.now().shift(seconds=+next_wait_seconds)
 
     CONSOLE.print(
-        (
-            f"\tRequest attempt [bold]#{retry_state.attempt_number}[/bold] threw "
+        left_pad(
+            f"Request attempt [bold]#{retry_state.attempt_number}[/bold] threw "
             f"exception: [red]{exception.args[0]}[/red]. Retrying after wait of "
-            f"{next_wait_seconds} seconds ({next_wait_expiry})..."
-        )
+            f"{next_wait_seconds} seconds ({next_wait_expiry})...",
+            level=2,
+        ),
     )
 
 
@@ -94,7 +99,7 @@ class RetryableHTTPException(Exception):
     after=print_failed_try,
     wait=wait_exponential(min=SECONDS_PER_REQUEST_LIMIT, max=MAX_WAIT_RETRY_DELAY),
 )
-def send_loc_request(url: str, client: httpx.Client) -> dict[str, Any]:
+def get_loc_response_json(url: httpx.URL, client: httpx.Client) -> dict[str, Any]:
     """
     Return the response of the HTTP request object.
 
@@ -102,15 +107,55 @@ def send_loc_request(url: str, client: httpx.Client) -> dict[str, Any]:
     """
     # in testing, the LOC api has been spewing 500s. maybe this is the rate limiting?
     try:
-        response = client.get(
-            url=url,
-        )
+        response = client.get(url=url)
+        # response = httpx.Response(200)
+        # raise httpx.RemoteProtocolError("lol")
     except httpx.ReadTimeout as read_timeout:
         raise RetryableHTTPException("Read time out") from read_timeout
     except httpx.RemoteProtocolError as remote_proto_error:
-        raise RetryableHTTPException(
-            f"Remote problem ({remote_proto_error})"
-        ) from remote_proto_error
+        # if we're here, it probably means LoC has closed the connection on their end
+        # because it took too long.
+        # so, let's readjust how much data we're asking for by reducing how many results
+        # per page we get (query param "c"). thusly, we need to update the current page
+        # we're on (query param "sp") to stay at the same spot.
+        #
+        # our reduction strategy is to split cur_results_per_page in half
+        #
+        # example:
+        #   cur_results_per_page = 30, cur_page = 5
+        #   decrease cur_results_per_page = 15
+        #   then cur_page = 10 (✔)
+
+        cur_results_per_page = int(client.params.get("c"))
+        if cur_results_per_page % 2 != 0:
+            # if we can't do split evenly because its odd, then we can't accurately
+            # determine the new current page, so just fail.
+            # example:
+            #   cur_results_per_page = 15, cur_page = 10
+            #   decrease cur_results_per_page = 7, maybe 8? doesn't cleanly divide
+            #   then cur_page = ??? it depends
+            #
+            # this is why using a power of two is a good idea: you get a lot of splits
+            raise remote_proto_error
+        new_results_per_page = cur_results_per_page // 2
+        # set the requests per page on the client! so it persists through out the rest
+        # of the program lifetime.
+        client.params = client.params.set("c", str(new_results_per_page))
+
+        cur_page = int(url.params.get("sp", 1)) - 1  # first page is one
+        new_page = cur_page * 2
+        new_url = url.copy_set_param("sp", str(new_page + 1))
+
+        CONSOLE.print(
+            left_pad(
+                f"Got {remote_proto_error}. Possibly due to requests per page being "
+                f"too high. Decreasing from {cur_results_per_page} to "
+                f"{new_results_per_page}.",
+                level=2,
+            ),
+        )
+
+        return get_loc_response_json(new_url, client)
 
     if response.status_code != httpx.codes.OK:
         if response.status_code == 429 or response.status_code in range(500, 600):
@@ -151,21 +196,16 @@ def create_filename(result: dict[str, Any], image_url: str) -> str:
     return safe_title
 
 
-def create_collection_dir_path(result: dict[str, Any], root_dir: Path) -> Path:
+def create_collection_dir_path(title: str, root_dir: Path) -> Path:
     """
     Create a dir name for aria2, which will be somewhere under root_dir. Tries to ensure
     its not too long, nor contains illegal characters. This dir name is based on the
-    "source_collection" key of the result json, such as "<root_dir>/<source_collection>.
-    If this key does not exist, the returned Path is simply the root_dir itself.
+    "title" key of the data json, such as "<root_dir>/<title>.
     """
-    if (
-        source_collection := glom(result, "item.source_collection", default=None)
-    ) is not None:
-        return root_dir / file_name_sanitize(source_collection)
-    return root_dir
+    return root_dir / file_name_sanitize(title)[:MAX_DIR_NAME_LENGTH]
 
 
-def get_highest_quality_image_url(result: dict[str, Any]) -> Optional[str]:
+def get_largest_image_url(result: dict[str, Any]) -> Optional[str]:
     """
     Returns the highest quality image URL from the result dict. If one does not exist,
     returns None.
@@ -192,6 +232,11 @@ def create_aria_option_line(key: str, value: str) -> str:
     # the whitespace is important: needs to be whitespace-prefixed to differentiate from
     # other URLs
     return f"  {key}={value}"
+
+
+def left_pad(text: str, level: int) -> Padding:
+    """Return a rich Padding object with only padding on the left."""
+    return Padding(f"- {text}", (0, 0, 0, level * 4))
 
 
 class AriaDirPathParamType(click.ParamType):
@@ -240,18 +285,10 @@ ARIA_DIR_PATH_PARAM_TYPE = AriaDirPathParamType()
     help=(
         "Outputs image URLs in a format that aria2c understands. (aria2c can consume "
         "this file with the -i/--input-file option.) For each url, the "
-        '"out" option is set to the item\'s title and "auto-file-renaming" is '
-        "disabled to prevent clobbering of preexisting files. See "
+        '"out" option is set to the item\'s title, the "dir" option is set to the '
+        'title of the collection, and the "auto-file-renaming" option is set to '
+        "false to prevent clobbering of preexisting files. See "
         "https://aria2.github.io/manual/en/html/aria2c.html#input-file for more info."
-    ),
-)
-@click.option(
-    "--group-by-collection/--no-group-by-collection",
-    default=True,
-    help=(
-        'When aria2c formatting, set the "dir" option to the item\'s collection name. '
-        "Items without a collection will be downloaded directly to the path of "
-        "root-dir."
     ),
 )
 @click.option(
@@ -263,9 +300,7 @@ ARIA_DIR_PATH_PARAM_TYPE = AriaDirPathParamType()
         "path."
     ),
 )
-def main(
-    url: str, aria_format: bool, group_by_collection: bool, root_dir: Path
-) -> None:
+def main(url: str, aria_format: bool, root_dir: Path) -> None:
     """
     Output a list of images from a Library of Congress query at URL.
 
@@ -274,22 +309,32 @@ def main(
     - loc-images "https://www.loc.gov/collections/baseball-cards/"
 
     - loc-images "https://www.loc.gov/photos/?q=bridges&dates=1800%2F1899"
+
+    Note: If you get charmap decode errors or something like that, you may have to set
+    PYTHONIOENCODING='utf-8' in your shell.
     """
     cur_url = url
+
+    # "results" give use the items to iterate over
+    # "pagination" tells us about subsequent pages
+    # "title" gives us the title of the search (or collection)
     params = {
         "fo": "json",
         "c": str(STARTING_RESULTS_PER_PAGE),
-        "at": "results,pagination",
+        "at": "results,pagination,title",
     }
+
+    CONSOLE.print(
+        left_pad(f"Scraping all images from [link={cur_url}]{cur_url}[/link]", level=0),
+    )
 
     with httpx.Client(params=params) as client:
         while True:
-            CONSOLE.print(f"Getting images from [link={cur_url}]{cur_url}[/link]")
+            CONSOLE.print(
+                left_pad(f"GET [link={cur_url}]{cur_url}[/link]", level=1),
+            )
 
-            # request =
-
-            data = send_loc_request(cur_url, client)
-            # data = response.json()
+            data = get_loc_response_json(httpx.URL(cur_url), client)
 
             for result in data["results"]:
                 # this usually means its only available at the physical library, not
@@ -318,7 +363,7 @@ def main(
                 ):
                     continue
 
-                image_url = get_highest_quality_image_url(result)
+                image_url = get_largest_image_url(result)
 
                 if image_url is None:
                     continue
@@ -336,14 +381,13 @@ def main(
                         )
                     )
 
-                    # if you want a nicer grouped structure, this option has URLs
-                    # downloaded to a directory named by the collection title
-                    if group_by_collection:
-                        lines.append(
-                            create_aria_option_line(
-                                "dir", str(create_collection_dir_path(result, root_dir))
-                            )
+                    # group images into a nicer structure
+                    lines.append(
+                        create_aria_option_line(
+                            "dir",
+                            str(create_collection_dir_path(data["title"], root_dir)),
                         )
+                    )
 
                     # forbids aria2 from downloading foo.1.jpg if foo.jpg exists, and
                     # instead, just skips the URL. we don't want duplicates, nor do we
