@@ -2,7 +2,6 @@
 Output a list of image URLs from a Library of Congress collection.
 """
 
-
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -21,7 +20,7 @@ from tenacity import (  # type: ignore
 from yarl import URL
 
 # user-friendly wrapper around stdout, prints statuses nicely
-CONSOLE = Console(stderr=True, highlight=False)
+CONSOLE = Console(highlight=False, stderr=True)
 
 # original formats (original representation of the item) that we want.
 # other types are like 'manuscript/mixed material' or 'sound recording' or 'web site'.
@@ -85,7 +84,7 @@ def print_failed_try(retry_state: RetryCallState) -> None:
             f"Request attempt [bold]#{retry_state.attempt_number}[/bold] threw "
             f"exception: [red]{exception.args[0]}[/red]. Retrying after wait of "
             f"{next_wait_seconds} seconds ({next_wait_expiry})...",
-            level=2,
+            level=1,
         ),
     )
 
@@ -151,12 +150,11 @@ def get_loc_response_json(url: httpx.URL, client: httpx.Client) -> dict[str, Any
                 f"Got {remote_proto_error}. Possibly due to requests per page being "
                 f"too high. Decreasing from {cur_results_per_page} to "
                 f"{new_results_per_page}.",
-                level=2,
+                level=1,
             ),
         )
 
         return get_loc_response_json(new_url, client)
-
     if response.status_code != httpx.codes.OK:
         if response.status_code == 429 or response.status_code in range(500, 600):
             # i haven't seen a 429, but i'd imagine that's what they'd use. for now,
@@ -324,22 +322,32 @@ def main(url: str, aria_format: bool, root_dir: Path) -> None:
         "at": "results,pagination,title",
     }
 
-    CONSOLE.print(
-        left_pad(f"Scraping all images from [link={cur_url}]{cur_url}[/link]", level=0),
-    )
+    current_page = 0
+    total_pages = 1  # just default for now, will get actual later
 
     with httpx.Client(params=params) as client:
         while True:
+            percent_done = current_page / total_pages
             CONSOLE.print(
-                left_pad(f"GET [link={cur_url}]{cur_url}[/link]", level=1),
+                left_pad(
+                    f"GET [link={cur_url}]{cur_url}[/link] ({percent_done:.2%} done)",
+                    level=0,
+                ), no_wrap=True
             )
 
             data = get_loc_response_json(httpx.URL(cur_url), client)
 
-            for result in data["results"]:
+            results = data["results"]
+            pagination = data["pagination"]
+            title = data["title"]
+
+            current_page = pagination["current"]
+            total_pages = pagination["total"]
+
+            for result in results:
                 # this usually means its only available at the physical library, not
-                # online. in these cases, an image might be available, but it'll be
-                # really small
+                # online. in these cases, an image might be available online, but it'll
+                # be really small
                 if result["access_restricted"] is True:
                     continue
 
@@ -372,7 +380,7 @@ def main(url: str, aria_format: bool, root_dir: Path) -> None:
 
                 if aria_format:
                     # little comment for humans about where to find the item on loc.gov
-                    lines.insert(0, f"# {result['id']}")
+                    lines.insert(0, f"# {result['url']}")
 
                     # sets the name of the output file because the defaults are gross
                     lines.append(
@@ -385,7 +393,7 @@ def main(url: str, aria_format: bool, root_dir: Path) -> None:
                     lines.append(
                         create_aria_option_line(
                             "dir",
-                            str(create_collection_dir_path(data["title"], root_dir)),
+                            str(create_collection_dir_path(title, root_dir)),
                         )
                     )
 
@@ -399,8 +407,8 @@ def main(url: str, aria_format: bool, root_dir: Path) -> None:
 
                 print("\n".join(lines))
 
-            if data["pagination"]["next"] is not None:
-                cur_url = data["pagination"]["next"]
+            if pagination["next"] is not None:
+                cur_url = pagination["next"]
                 time.sleep(SECONDS_PER_REQUEST_LIMIT)
             else:
                 break
