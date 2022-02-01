@@ -51,11 +51,11 @@ SECONDS_PER_REQUEST_LIMIT = 60 / 80
 MAX_WAIT_RETRY_DELAY = 4096
 
 # max length of the path stem for aria2 formatting
-# this is arbitrary, but i know there's a limit, and it's probably just a bit over this
-MAX_PATH_STEM_LENGTH = 200
+# this is arbitrary, but i know there's a limit
+MAX_PATH_STEM_LENGTH = 100
 
 # max dir length. again, arbitrary, but i know there's some limit
-MAX_DIR_NAME_LENGTH = 200
+MAX_DIR_NAME_LENGTH = 100
 
 # results per page
 # ideally, its as high as possible to reduce request count. but somewhere too high, the
